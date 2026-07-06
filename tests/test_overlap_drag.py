@@ -290,3 +290,86 @@ def test_stick_drop_splits_both_shapes_with_colors():
     # red main body + its cut-off corner piece both red
     reds = [f for f in shape.fills.values() if f.color.to_hex() == "#e63946"]
     assert any(shape.fill_contains(r, Vec2(500, 300)) for r in reds)
+
+
+def _drag(tool, x0, y0, x1, y1):
+    from animengine.ui.tools import ToolEvent
+
+    tool.press(ToolEvent(pos=Vec2(x0, y0)))
+    for i in range(1, 7):
+        t = i / 6
+        tool.move(ToolEvent(pos=Vec2(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)))
+    tool.release(ToolEvent(pos=Vec2(x1, y1)))
+
+
+def test_fill_drag_leaves_bite_in_neighbor():
+    """Dragging a fill whose boundary is shared with a neighbouring fill
+    (after planarization) must leave the neighbour a stationary copy of the
+    shared edges, not rip its outline along."""
+    from animengine.ui.state import EditorState
+    from animengine.ui.tools import SelectTool
+
+    state = EditorState()
+    p = state.project
+    p.add_rect(90, 110, 310, 195)
+    p.fill_region(240, 200, "#b05fd6")
+    # curved-sided wedge drawn already dipping into the rect: its red upper
+    # face is bounded below by a piece of the rect's own top edge
+    p.add_line(145, 75, 318, 75)
+    p.add_curve(145, 75, 185, 110, 210, 120, 235, 135)
+    p.add_curve(235, 135, 260, 120, 285, 110, 318, 75)
+    p.fill_region(235, 95, "#e11d2e")
+
+    _drag(SelectTool(state), 235, 95, 395, 35)
+
+    shape = p.active_layer.keyframes[0].shape
+    purples = [f for f in shape.fills.values() if f.color.to_hex() == "#b05fd6"]
+    reds = [f for f in shape.fills.values() if f.color.to_hex() == "#e11d2e"]
+    assert reds and all(shape.fill_polygon(r) for r in reds)
+    # the rect is whole: all four corners and the area just under the top
+    # edge (where the shared piece was) are still purple
+    for probe in (Vec2(100, 120), Vec2(390, 120), Vec2(240, 115), Vec2(240, 290)):
+        assert any(shape.fill_contains(f, probe) for f in purples), probe
+    # nothing purple was smeared outside the original rect
+    for f in purples:
+        for loop in shape.fill_polygon(f):
+            for pt in loop:
+                assert 89 <= pt.x <= 401 and 109 <= pt.y <= 306, pt
+
+
+def test_second_drag_deepens_bite_cleanly():
+    """Dropping a shape onto another and dragging it again must not leave
+    the first drop's boundary stubs behind, nor deform the shape below."""
+    from animengine.ui.state import EditorState
+    from animengine.ui.tools import SelectTool
+
+    state = EditorState()
+    p = state.project
+    p.add_rect(90, 110, 310, 195)
+    p.fill_region(240, 200, "#b05fd6")
+    p.add_line(145, 20, 318, 20)
+    p.add_curve(145, 20, 185, 55, 210, 65, 235, 80)
+    p.add_curve(235, 80, 260, 65, 285, 55, 318, 20)
+    p.fill_region(235, 40, "#e11d2e")
+
+    tool = SelectTool(state)
+    _drag(tool, 235, 40, 235, 95)   # tip 25 px into the rect
+    _drag(tool, 235, 95, 235, 115)  # nudge 20 px deeper
+
+    shape = p.active_layer.keyframes[0].shape
+    reds = [f for f in shape.fills.values() if f.color.to_hex() == "#e11d2e"]
+    purples = [f for f in shape.fills.values() if f.color.to_hex() == "#b05fd6"]
+    tip = Vec2(235, 145)
+    assert any(shape.fill_contains(r, tip) for r in reds)
+    assert not any(shape.fill_contains(f, tip) for f in purples)
+    assert any(shape.fill_contains(f, Vec2(240, 250)) for f in purples)
+    # no leftover top-edge stubs poking into the red shape
+    for c in shape.connections.values():
+        mid = shape.connection_midpoint(c)
+        covered = any(
+            shape.fill_contains(r, mid)
+            and c.id not in {e.conn_id for lp in r.loops for e in lp}
+            and shape._fill_boundary_distance(r, mid) > 0.5
+            for r in reds
+        )
+        assert not covered, (c.id, mid)

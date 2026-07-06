@@ -384,6 +384,45 @@ class Shape:
         self.touch()
         return dup.id
 
+    def _clone_connection(self, c: Connection) -> Connection:
+        """A coincident copy of a connection (control handles duplicated)."""
+        c1 = c2 = None
+        if c.c1 is not None:
+            p = self.points[c.c1]
+            c1 = self.add_point(p.pos, is_control=True, anchor=p.anchor).id
+        if c.c2 is not None:
+            p = self.points[c.c2]
+            c2 = self.add_point(p.pos, is_control=True, anchor=p.anchor).id
+        return self.add_connection(c.p1, c.p2, kind=c.kind, c1=c1, c2=c2,
+                                   width=c.width, color=c.color,
+                                   only_shape=c.only_shape)
+
+    def detach_fill_boundary(self, fill_id: int) -> None:
+        """Give a fill exclusive ownership of its boundary connections.
+
+        Planarization and drop-merge re-traces leave neighbouring fills
+        sharing boundary connections; dragging one fill would then deform the
+        other. Rewires every other fill referencing this fill's boundary onto
+        a coincident copy (its Flash-style "bite" outline stays behind)."""
+        f = self.fills.get(fill_id)
+        if f is None:
+            return
+        mine = f.connection_ids()
+        copies: dict[int, int] = {}
+        for g in self.fills.values():
+            if g.id == fill_id:
+                continue
+            for loop in g.loops:
+                for e in loop:
+                    if e.conn_id not in mine:
+                        continue
+                    if e.conn_id not in copies:
+                        copies[e.conn_id] = self._clone_connection(
+                            self.connections[e.conn_id]).id
+                    e.conn_id = copies[e.conn_id]
+        if copies:
+            self.touch()
+
     def split_connection(self, conn_id: int, pos: Vec2) -> tuple[Point, Connection, Connection]:
         """Split a connection at (approximately) pos; returns (new point, part1, part2).
 
@@ -594,20 +633,28 @@ class Shape:
         return inserted
 
     def _dedupe_conn(self, ca: Connection) -> bool:
-        """Merge *ca* into a coincident duplicate straight edge (same two
-        endpoints). Collinear overlapping shapes produce these after their
-        T-contacts are split; duplicates corrupt face tracing and fills."""
-        if ca.kind is not ConnKind.LINE:
-            return False
+        """Merge *ca* into a coincident duplicate edge (same two endpoints
+        and, for curves, matching control positions). Collinear overlapping
+        shapes and detached fill boundaries dropped back in place produce
+        these; duplicates corrupt face tracing and fills."""
         idx = self.index()
         for cid in tuple(idx.adjacency.get(ca.p1, ())):
             if cid == ca.id:
                 continue
             cb = self.connections.get(cid)
-            if cb is None or cb.kind is not ConnKind.LINE:
+            if cb is None or cb.kind is not ca.kind:
                 continue
             if {cb.p1, cb.p2} != {ca.p1, ca.p2}:
                 continue
+            if ca.kind is not ConnKind.LINE:
+                ctrls_a = [self.pos(i) for i in ca.control_ids()]
+                ctrls_b = [self.pos(i) for i in cb.control_ids()]
+                if cb.p1 != ca.p1:
+                    ctrls_b.reverse()
+                if len(ctrls_a) != len(ctrls_b) or any(
+                    a.distance_to(b) > 1e-6 for a, b in zip(ctrls_a, ctrls_b, strict=True)
+                ):
+                    continue
             # rewrite fill references from ca to the kept duplicate cb
             flipped = cb.p1 != ca.p1
             for f in self.fills.values():

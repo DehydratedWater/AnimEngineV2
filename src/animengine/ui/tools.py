@@ -522,6 +522,9 @@ class SelectTool(Tool):
             session = self.project.edit_shape()
             live = session.shape
             live_fill = live.fills[fill.id]
+            # Flash-style: neighbours sharing this fill's boundary keep a
+            # stationary copy (their "bite"), so the drag can't deform them
+            live.detach_fill_boundary(fill.id)
             fill_conns = set(live_fill.connection_ids())
             idx = live.index()
             ids: set[int] = set()
