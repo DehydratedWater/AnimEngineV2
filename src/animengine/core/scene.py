@@ -500,6 +500,32 @@ class Shape:
                 return hit
         return None
 
+    def split_at_segment(self, a: Vec2, b: Vec2) -> list[int]:
+        """Split every connection crossing segment a-b at the crossing point.
+
+        Used by the cut-out selection (v1's default marquee slices strokes at
+        the box border). Returns ids of the split points created."""
+        created: list[int] = []
+        for _ in range(256):
+            hit = None
+            for c in list(self.connections.values()):
+                pts = self.sample_connection(c)
+                for i in range(len(pts) - 1):
+                    p = segment_intersection(pts[i], pts[i + 1], a, b)
+                    if p is None:
+                        continue
+                    if p.distance_to(pts[0]) < 1e-3 or p.distance_to(pts[-1]) < 1e-3:
+                        continue
+                    hit = (c.id, p)
+                    break
+                if hit:
+                    break
+            if hit is None:
+                break
+            mid, _, _ = self.split_connection(hit[0], hit[1])
+            created.append(mid.id)
+        return created
+
     # ------------------------------------------------------- fill trace
     def detect_region(self, pos: Vec2) -> list[list[FillEdge]] | None:
         """Find the enclosed region containing pos (bucket-fill target).

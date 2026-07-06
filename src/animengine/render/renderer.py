@@ -29,13 +29,18 @@ _app: QGuiApplication | None = None
 
 
 def ensure_gui_app() -> QGuiApplication:
-    """Create a (possibly offscreen) QGuiApplication if none exists yet."""
+    """Create a (possibly offscreen) Qt application if none exists yet.
+
+    A full QApplication is created so that both headless rendering and any
+    later widget creation share the same instance (Qt allows only one)."""
     global _app
     app = QGuiApplication.instance()
     if app is None:
+        from PySide6.QtWidgets import QApplication
+
         if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
             os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        _app = QGuiApplication(sys.argv[:1])
+        _app = QApplication(sys.argv[:1])
         app = _app
     return app
 

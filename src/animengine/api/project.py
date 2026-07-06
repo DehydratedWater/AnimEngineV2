@@ -17,6 +17,7 @@ from animengine.core import (
     BLACK,
     Color,
     Command,
+    ConnKind,
     Document,
     Interp,
     Placement,
@@ -646,6 +647,107 @@ class AnimProject:
         layer = self.doc.add_raster_layer(name, image=img)
         self.active_layer_id = layer.id
         return layer
+
+    # --------------------------------------------------------- sessions
+    def edit_shape(self, layer_id: int | None = None, frame: int | None = None):
+        """Interactive session: mutate .shape live, then commit(label)/cancel()."""
+        from .sessions import ShapeEditSession
+
+        layer = self._vector_layer(layer_id)
+        frame = self.current_frame if frame is None else frame
+        self.doc.extend_to(frame)
+        return ShapeEditSession(self, layer, frame)
+
+    def edit_raster(self, layer_id: int | None = None, frame: int | None = None):
+        from .sessions import RasterPaintSession
+
+        layer = self._resolve_layer(layer_id)
+        if not isinstance(layer, RasterLayer):
+            raise TypeError("edit_raster needs a raster layer")
+        frame = self.current_frame if frame is None else frame
+        kf = layer.ensure_keyframe(frame)
+        if kf is None:
+            raise ValueError("raster layer has no image")
+        return RasterPaintSession(self, self.doc.images[kf.image_id])
+
+    def edit_placement(self, layer_id: int | None = None, frame: int | None = None):
+        from .sessions import PlacementEditSession
+
+        layer = self._resolve_layer(layer_id)
+        if not isinstance(layer, RasterLayer):
+            raise TypeError("edit_placement needs a raster layer")
+        frame = self.current_frame if frame is None else frame
+        return PlacementEditSession(self, layer, frame)
+
+    # ------------------------------------------------- extra vector ops
+    def add_smooth_curve(self, points: Iterable[tuple[float, float]], *,
+                         close: bool = False, width: float = 3.0,
+                         color: str | Color | None = None, smoothness: float = 0.35,
+                         layer_id: int | None = None,
+                         frame: int | None = None) -> dict:
+        """Fit smooth cubic beziers through the given points (Catmull-Rom
+        tangents) — the freehand smooth-pen tool."""
+        pts = [Vec2(x, y) for x, y in points]
+        if len(pts) < 2:
+            raise ValueError("need at least two points")
+        col = _color(color)
+
+        def fn(shape: Shape) -> dict:
+            anchors = [shape.add_point(p) for p in pts]
+            n = len(pts)
+            conn_ids = []
+            seg_count = n if close else n - 1
+            for j in range(seg_count):
+                a, b = anchors[j], anchors[(j + 1) % n]
+                prev_p = pts[(j - 1) % n] if (close or j > 0) else pts[j]
+                next_p = pts[(j + 2) % n] if (close or j + 2 < n) else pts[(j + 1) % n]
+                t1 = (pts[(j + 1) % n] - prev_p) * smoothness
+                t2 = (next_p - pts[j]) * smoothness
+                c1 = shape.add_point(pts[j] + t1, is_control=True, anchor=a.id)
+                c2 = shape.add_point(pts[(j + 1) % n] - t2, is_control=True, anchor=b.id)
+                conn = shape.add_connection(a.id, b.id, kind=ConnKind.CUBIC,
+                                            c1=c1.id, c2=c2.id, width=width, color=col)
+                conn_ids.append(conn.id)
+            shape.insert_intersections(conn_ids)
+            return {"connection_ids": conn_ids}
+
+        return self._edit("Draw smooth curve", fn, layer_id, frame)
+
+    def separate_connection_at(self, x: float, y: float, *,
+                               max_dist: float = SNAP_RADIUS,
+                               layer_id: int | None = None,
+                               frame: int | None = None) -> bool:
+        """Detach the nearest connection: give it its own duplicated endpoints
+        (v1's separate tool)."""
+        pos = Vec2(x, y)
+
+        def fn(shape: Shape) -> bool:
+            conn = shape.nearest_connection(pos, max_dist=max_dist)
+            if conn is None:
+                return False
+            for attr in ("p1", "p2"):
+                pid = getattr(conn, attr)
+                if sum(1 for c in shape.connections.values()
+                       if pid in (c.p1, c.p2)) > 1:
+                    dup = shape.add_point(shape.pos(pid))
+                    setattr(conn, attr, dup.id)
+            return True
+
+        return self._edit("Separate connection", fn, layer_id, frame)
+
+    def remove_fill_at(self, x: float, y: float, *, layer_id: int | None = None,
+                       frame: int | None = None) -> bool:
+        """Delete the fill containing (x, y) — right-click of the bucket tool."""
+        pos = Vec2(x, y)
+
+        def fn(shape: Shape) -> bool:
+            for f in list(shape.fills.values()):
+                if shape.fill_contains(f, pos):
+                    shape.remove_fill(f.id)
+                    return True
+            return False
+
+        return self._edit("Remove fill", fn, layer_id, frame)
 
     # ------------------------------------------------------------- audio
     def add_audio(self, path: str | Path, *, start_frame: int = 0,
