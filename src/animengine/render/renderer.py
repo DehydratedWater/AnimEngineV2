@@ -108,12 +108,44 @@ def _append_loop(path: QPainterPath, shape: Shape, loop) -> None:
     path.closeSubpath()
 
 
+def _loop_signed_area(shape: Shape, loop) -> float:
+    poly = []
+    for e in loop:
+        conn = shape.connections.get(e.conn_id)
+        if conn is None:
+            return 0.0
+        pts = shape.sample_connection(conn, samples=8)
+        if e.reversed:
+            pts = pts[::-1]
+        poly.extend(pts[:-1])
+    return sum(a.cross(b) for a, b in zip(poly, poly[1:] + poly[:1], strict=True)) / 2
+
+
+def _reversed_loop(loop):
+    from animengine.core import FillEdge
+
+    return [FillEdge(e.conn_id, not e.reversed) for e in reversed(loop)]
+
+
 def fill_path(shape: Shape, fill) -> QPainterPath | None:
+    """Build the fill outline path.
+
+    Uses nonzero winding like the original (Java2D default): a deformed,
+    self-crossing boundary still fills solid instead of leaving even-odd
+    slivers. Hole loops are normalized to wind opposite to the outline so
+    they still subtract.
+    """
     if any(any(e.conn_id not in shape.connections for e in loop) for loop in fill.loops):
         return None  # boundary connection deleted -> fill invalid
     path = QPainterPath()
-    path.setFillRule(Qt.FillRule.OddEvenFill)
-    for loop in fill.loops:
+    path.setFillRule(Qt.FillRule.WindingFill)
+    outline_sign = 0.0
+    for i, loop in enumerate(fill.loops):
+        area = _loop_signed_area(shape, loop)
+        if i == 0:
+            outline_sign = area
+        elif outline_sign != 0 and area * outline_sign > 0:
+            loop = _reversed_loop(loop)  # hole must wind opposite the outline
         _append_loop(path, shape, loop)
     return path
 

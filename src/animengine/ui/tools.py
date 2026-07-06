@@ -41,6 +41,15 @@ def _conns_of_points(shape, point_ids) -> set[int]:
     return out
 
 
+def _with_attached_controls(shape, point_ids: set[int]) -> set[int]:
+    """Extend a point set with control handles anchored to its anchor points,
+    so curves attached at shared/welded vertices follow the drag."""
+    out = set(point_ids)
+    for pid in point_ids:
+        out |= {c.id for c in shape.controls_of(pid)}
+    return out
+
+
 @dataclass
 class ToolEvent:
     pos: Vec2  # document coords
@@ -502,6 +511,7 @@ class SelectTool(Tool):
         if conn is not None:
             session = self.project.edit_shape()
             ids = {conn.p1, conn.p2, *conn.control_ids()}
+            ids = _with_attached_controls(session.shape, ids)
             self.drag = _DragState("conn", ev.pos, session,
                                    extra={"ids": ids, "last": ev.pos})
             self._mark_drag(session.shape, ids)
@@ -515,6 +525,7 @@ class SelectTool(Tool):
                 c = session.shape.connections.get(cid)
                 if c:
                     ids |= {c.p1, c.p2, *c.control_ids()}
+            ids = _with_attached_controls(session.shape, ids)
             self.drag = _DragState("fill", ev.pos, session,
                                    extra={"ids": ids, "last": ev.pos})
             self._mark_drag(session.shape, ids)
@@ -657,14 +668,15 @@ class SelectTool(Tool):
                                              exclude={p.id})
                 if target is not None:
                     shape.merge_points(target.id, p.id)
-        if d.mode in ("point", "conn", "fill"):
-            moved = (
-                {d.point_id, *(c.id for c in d.session.shape.controls_of(d.point_id))}
-                if d.mode == "point"
-                else d.extra["ids"]
-            )
-            moved_conns = _conns_of_points(d.session.shape, moved)
-            d.session.shape.insert_intersections(list(moved_conns))
+        if d.mode == "point":
+            moved = {d.point_id,
+                     *(c.id for c in d.session.shape.controls_of(d.point_id))}
+        elif d.mode in ("conn", "fill"):
+            moved = d.extra["ids"]
+        else:  # move / scale / rotate via the transform box
+            moved = set(d.extra["originals"])
+        moved_conns = _conns_of_points(d.session.shape, moved)
+        d.session.shape.insert_intersections(list(moved_conns))
         d.session.commit(label)
         if d.mode in ("move", "scale", "rotate"):
             state.recompute_selection_box()

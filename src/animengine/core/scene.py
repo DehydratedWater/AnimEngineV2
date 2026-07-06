@@ -664,16 +664,27 @@ class Shape:
         if best is None:
             return None
         _, outline, outline_poly = best
-        loops = [outline]
-        # holes: smallest containing faces of separate components inside the outline
+        # hole candidates: exterior (negative-area) cycles of other components
+        # lying inside the outline
         outline_conns = {e.conn_id for e in outline}
+        candidates: list[tuple[list[FillEdge], list[Vec2]]] = []
         for cycle in faces:
             poly = self._cycle_polygon(cycle)
             if len(poly) < 3 or polygon_area(poly) >= -1e-9:
-                continue  # want exterior (negative-area) cycles of other components
+                continue
             if {e.conn_id for e in cycle} & outline_conns:
                 continue
             if all(point_in_polygon(p, outline_poly) for p in poly[:3]):
+                candidates.append((cycle, poly))
+        # keep only *direct* holes: islands nested inside another hole belong
+        # to deeper faces, not to the clicked region's boundary
+        loops = [outline]
+        for i, (cycle, poly) in enumerate(candidates):
+            nested = any(
+                j != i and all(point_in_polygon(p, other_poly) for p in poly[:3])
+                for j, (_, other_poly) in enumerate(candidates)
+            )
+            if not nested:
                 loops.append(cycle)
         return loops
 

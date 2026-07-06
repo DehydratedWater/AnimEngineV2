@@ -71,16 +71,21 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ toolbar
     def _build_toolbar(self) -> None:
+        from PySide6.QtCore import QSize
+
+        from .icons import tool_icon
+
         bar = QToolBar("Tools", self)
         bar.setObjectName("tools")
         bar.setOrientation(Qt.Orientation.Vertical)
+        bar.setIconSize(QSize(28, 28))
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, bar)
         group = QActionGroup(self)
         group.setExclusive(True)
         for tool_cls in ALL_TOOLS:
             tool = tool_cls(self.state)
             self.tools[tool.name] = tool
-            action = QAction(tool.label, self)
+            action = QAction(tool_icon(tool.name), tool.label, self)
             action.setCheckable(True)
             if tool.shortcut:
                 action.setShortcut(tool.shortcut)

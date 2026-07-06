@@ -49,6 +49,19 @@ def _color(c: str | Color | None, default: Color = BLACK) -> Color:
     return Color.from_hex(c)
 
 
+def _planarize_moved(shape: Shape, moved_point_ids: list[int]) -> None:
+    """After points moved, cut any crossings involving their connections
+    (v1 re-ran its intersection finder after every marked-points move)."""
+    if not moved_point_ids:
+        return
+    idx = shape.index()
+    conns: set[int] = set()
+    for pid in moved_point_ids:
+        conns |= idx.adjacency.get(pid, set())
+    if conns:
+        shape.insert_intersections(list(conns))
+
+
 class _ShapeEdit(Command):
     """Undoable mutation of one vector keyframe's shape."""
 
@@ -426,14 +439,15 @@ class AnimProject:
             shape.move_point(point_id, Vec2(x, y))
             for ctrl in shape.controls_of(point_id):
                 shape.move_point(ctrl.id, ctrl.pos + delta)
+            survivor = point_id
             if merge and not shape.points[point_id].is_control:
-                target = None
-                for p in shape.anchor_points():
-                    if p.id != point_id and p.pos.distance_to(Vec2(x, y)) <= SNAP_RADIUS:
-                        target = p
-                        break
+                target = shape.nearest_point(Vec2(x, y), max_dist=SNAP_RADIUS,
+                                             include_controls=False,
+                                             exclude={point_id})
                 if target is not None:
                     shape.merge_points(target.id, point_id)
+                    survivor = target.id
+            _planarize_moved(shape, [survivor])
 
         self._edit("Move point", fn, layer_id, frame)
 
@@ -444,6 +458,7 @@ class AnimProject:
             for pid, (x, y) in offsets.items():
                 if pid in shape.points:
                     shape.move_point(pid, Vec2(x, y))
+            _planarize_moved(shape, list(offsets))
 
         self._edit("Move points", fn, layer_id, frame)
 
@@ -475,6 +490,7 @@ class AnimProject:
                 if rotate_deg:
                     v = v.rotated(math.radians(rotate_deg))
                 shape.move_point(p.id, center + v + Vec2(dx, dy))
+            _planarize_moved(shape, [p.id for p in pts])
 
         self._edit("Transform points", fn, layer_id, frame)
 
