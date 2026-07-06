@@ -27,6 +27,7 @@ from .geometry import (
     point_in_polygon,
     point_segment_distance,
     polygon_area,
+    polygon_interior_point,
     quadratic_bezier,
     segment_intersection,
 )
@@ -349,6 +350,40 @@ class Shape:
         self._del_point(remove_id)
         self.touch()
 
+    def detach_point(self, point_id: int, conn_ids: set[int]) -> int:
+        """Duplicate a shared vertex for the given connections.
+
+        The connections in *conn_ids* are rewired to a new coincident point
+        (returned); all other connections keep the original. Control handles
+        anchored to the point follow whichever side owns their curve. Used
+        when dragging a fill away from geometry welded onto its boundary."""
+        p = self.points[point_id]
+        dup = self.add_point(p.pos)
+        for cid in conn_ids:
+            c = self.connections.get(cid)
+            if c is None or point_id not in (c.p1, c.p2):
+                continue
+            if self._index is not None:
+                self._index.remove_conn(cid, c)
+            if c.p1 == point_id:
+                c.p1 = dup.id
+            if c.p2 == point_id:
+                c.p2 = dup.id
+            if self._index is not None:
+                self._index.add_conn(c)
+        for ctrl in list(self.controls_of(point_id)):
+            owner_conns = (self._index.adjacency.get(ctrl.id, set())
+                           if self._index is not None else
+                           {c.id for c in self.connections.values()
+                            if ctrl.id in (c.c1, c.c2)})
+            if owner_conns & conn_ids:
+                ctrl.anchor = dup.id
+                if self._index is not None:
+                    self._index.controls.get(point_id, set()).discard(ctrl.id)
+                    self._index.controls.setdefault(dup.id, set()).add(ctrl.id)
+        self.touch()
+        return dup.id
+
     def split_connection(self, conn_id: int, pos: Vec2) -> tuple[Point, Connection, Connection]:
         """Split a connection at (approximately) pos; returns (new point, part1, part2).
 
@@ -527,6 +562,9 @@ class Shape:
             ca = self.connections.get(ca_id)
             if ca is None:
                 continue
+            if self._dedupe_conn(ca):
+                inserted += 1
+                continue
             hit = self._first_crossing_of(ca)
             if hit is None:
                 continue
@@ -554,6 +592,34 @@ class Shape:
                 queue += [a1.id, a2.id]
             inserted += 1
         return inserted
+
+    def _dedupe_conn(self, ca: Connection) -> bool:
+        """Merge *ca* into a coincident duplicate straight edge (same two
+        endpoints). Collinear overlapping shapes produce these after their
+        T-contacts are split; duplicates corrupt face tracing and fills."""
+        if ca.kind is not ConnKind.LINE:
+            return False
+        idx = self.index()
+        for cid in tuple(idx.adjacency.get(ca.p1, ())):
+            if cid == ca.id:
+                continue
+            cb = self.connections.get(cid)
+            if cb is None or cb.kind is not ConnKind.LINE:
+                continue
+            if {cb.p1, cb.p2} != {ca.p1, ca.p2}:
+                continue
+            # rewrite fill references from ca to the kept duplicate cb
+            flipped = cb.p1 != ca.p1
+            for f in self.fills.values():
+                for loop in f.loops:
+                    for e in loop:
+                        if e.conn_id == ca.id:
+                            e.conn_id = cb.id
+                            if flipped:
+                                e.reversed = not e.reversed
+            self.remove_connection(ca.id, prune_points=False)
+            return True
+        return False
 
     def _first_crossing_of(self, ca: Connection) -> tuple[int, Vec2] | None:
         """First crossing of *ca* against nearby connections (index query +
@@ -591,9 +657,9 @@ class Shape:
         return min(xs), min(ys), max(xs), max(ys)
 
     def _connections_cross(self, ca: Connection, cb: Connection) -> Vec2 | None:
-        pa = self.sample_connection(ca, samples=8) if ca.kind is not ConnKind.LINE \
+        pa = self.sample_connection(ca, samples=16) if ca.kind is not ConnKind.LINE \
             else self.sample_connection(ca)
-        pb = self.sample_connection(cb, samples=8) if cb.kind is not ConnKind.LINE \
+        pb = self.sample_connection(cb, samples=16) if cb.kind is not ConnKind.LINE \
             else self.sample_connection(cb)
         tol = 1e-3
         for i in range(len(pa) - 1):
@@ -608,6 +674,21 @@ class Shape:
                 if at_a_tip and at_b_tip:
                     continue  # tips already coincide -> handled by point snapping
                 return hit
+        # collinear overlaps / T-contacts are invisible to segment_intersection:
+        # report a tip of one connection lying on the interior of the other
+        contact_tol = 0.25
+        for tip in (pa[0], pa[-1]):
+            if tip.distance_to(pb[0]) < tol or tip.distance_to(pb[-1]) < tol:
+                continue
+            for j in range(len(pb) - 1):
+                if point_segment_distance(tip, pb[j], pb[j + 1]) < contact_tol:
+                    return tip
+        for tip in (pb[0], pb[-1]):
+            if tip.distance_to(pa[0]) < tol or tip.distance_to(pa[-1]) < tol:
+                continue
+            for i in range(len(pa) - 1):
+                if point_segment_distance(tip, pa[i], pa[i + 1]) < contact_tol:
+                    return tip
         return None
 
     def split_at_segment(self, a: Vec2, b: Vec2) -> list[int]:
@@ -781,30 +862,42 @@ class Shape:
         if not doomed:
             return 0
         doomed_set = set(doomed)
-        # capture colors + interior sample points of fills about to lose edges
-        damaged: list[tuple[Color, list[Vec2]]] = []
-        for f in list(self.fills.values()):
+        # capture colors + flattened old regions of fills about to lose edges
+        # (topmost damaged first, so overlaps resolve by draw order)
+        damaged: list[tuple[Color, list[list[Vec2]]]] = []
+        for f in reversed(list(self.fills.values())):
             if f.id != fill_id and doomed_set & f.connection_ids():
-                damaged.append((f.color, self.interior_samples(f)))
+                damaged.append((f.color, self.fill_polygon(f)))
         for cid in doomed:
             self.remove_connection(cid)
-        # re-trace the visible remainders of the damaged fills
+        # re-create the visible remainders: enumerate every face of the planar
+        # graph and refill those that belonged to a damaged fill's old region
+        # (face-driven, so small cut-off slivers are never missed)
         if damaged:
             faces = self._trace_faces()
-            for color, samples in damaged:
-                seen: set[frozenset] = set()
-                for pt in samples:
-                    if self.fill_contains(top, pt):
-                        continue  # covered part is gone by definition
+            seen: set[frozenset] = set()
+            top_key = frozenset(e.conn_id for e in top.loops[0])
+            for cycle in faces:
+                poly = self._cycle_polygon(cycle)
+                if len(poly) < 3 or polygon_area(poly) <= 1e-9:
+                    continue
+                pt = polygon_interior_point(poly)
+                if pt is None or self.fill_contains(top, pt):
+                    continue
+                if any(self.fill_contains(g, pt) for g in self.fills.values()):
+                    continue  # already covered by a surviving fill
+                for color, old_loops in damaged:
+                    inside_old = sum(point_in_polygon(pt, lp)
+                                     for lp in old_loops if len(lp) >= 3) % 2 == 1
+                    if not inside_old:
+                        continue
                     loops = self.detect_region(pt, faces=faces)
-                    if not loops:
-                        continue
-                    key = frozenset(e.conn_id for e in loops[0])
-                    if key in seen or key == frozenset(
-                            e.conn_id for e in top.loops[0]):
-                        continue
-                    seen.add(key)
-                    self.add_fill(loops, color)
+                    if loops:
+                        key = frozenset(e.conn_id for e in loops[0])
+                        if key not in seen and key != top_key:
+                            seen.add(key)
+                            self.add_fill(loops, color)
+                    break
             self.raise_fill(fill_id)  # dropped fill stays on top of remainders
         return len(doomed)
 

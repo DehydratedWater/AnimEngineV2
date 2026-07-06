@@ -70,8 +70,9 @@ def test_select_tool_box_drag_cuts_overlaps():
     assert len(crossing_points(shape)) >= 2
 
 
-def test_fill_drag_moves_foreign_control_handles():
-    """A curve handle anchored to a fill's shared vertex must follow the drag."""
+def test_fill_drag_detaches_from_welded_geometry():
+    """Flash semantics: grabbing a fill rips its boundary free of geometry
+    welded onto it — the outside curve stays put, the fill moves whole."""
     from animengine.ui.state import EditorState
     from animengine.ui.tools import SelectTool, ToolEvent
 
@@ -79,8 +80,7 @@ def test_fill_drag_moves_foreign_control_handles():
     p = state.project
     p.add_rect(0, 0, 100, 100)
     p.fill_region(50, 50, "#00cc66")
-    # attach an outside curve to the square's corner (0,0): its start control
-    # is anchored to the shared corner point
+    # attach an outside curve to the square's corner (0,0) (welded endpoint)
     p.add_curve(0, 0, -40, -40, -80, -10, -120, 0, snap=True)
     shape = p.active_layer.keyframes[0].shape
     ctrl = next(pt for pt in shape.points.values()
@@ -96,8 +96,14 @@ def test_fill_drag_moves_foreign_control_handles():
     tool.move(ev(80, 90))        # drag by (30, 40)
     tool.release(ev(80, 90))
     shape = p.active_layer.keyframes[0].shape
-    moved_ctrl = shape.points[ctrl.id]
-    assert moved_ctrl.pos.distance_to(old_ctrl_pos + Vec2(30, 40)) < 1e-6
+    # the outside curve and its handle did NOT move
+    kept_ctrl = shape.points[ctrl.id]
+    assert kept_ctrl.pos.distance_to(old_ctrl_pos) < 1e-6
+    assert shape.nearest_point(Vec2(-120, 0), max_dist=1.0) is not None
+    # the fill moved rigidly
+    fill = next(iter(shape.fills.values()))
+    assert shape.fill_contains(fill, Vec2(80, 90))
+    assert not shape.fill_contains(fill, Vec2(10, 10))
 
 
 @pytest.mark.parametrize("probe", [(60, 40), (60, 80)])
@@ -225,3 +231,62 @@ def test_drop_merge_spares_preexisting_decorations():
     _drag_fill(state, (200, 260), (208, 266))  # nudge the fill slightly
     shape = p.active_layer.keyframes[0].shape
     assert len(shape.connections) == before, "decoration stroke was eaten"
+
+
+def test_collinear_overlap_produces_no_duplicate_edges():
+    """User report: shapes touching along a collinear edge created duplicate
+    coincident connections that corrupted face tracing and fill colors."""
+    p = AnimProject(700, 500)
+    p.add_rect(30, 90, 240, 210)    # green right edge at x=270, y 90..300
+    p.fill_region(150, 200, "#57cc7a")
+    p.add_rect(270, 210, 300, 200)  # red left edge at x=270, y 210..410
+    p.fill_region(420, 310, "#e63946")
+    shape = p.active_layer.keyframes[0].shape
+    # no two straight connections may share the same endpoint pair
+    pairs = [frozenset((c.p1, c.p2)) for c in shape.connections.values()]
+    assert len(pairs) == len(set(pairs)), "duplicate coincident edges exist"
+    # both fills still hit-test correctly on their own side
+    green = next(f for f in shape.fills.values() if f.color.to_hex() == "#57cc7a")
+    red = next(f for f in shape.fills.values() if f.color.to_hex() == "#e63946")
+    assert shape.fill_contains(green, Vec2(150, 200))
+    assert shape.fill_contains(red, Vec2(420, 310))
+
+
+def test_stick_drop_splits_both_shapes_with_colors():
+    """A thin bar dropped across two shapes must cut both, keep every piece
+    filled with its original color, and not deform either shape."""
+    from animengine.ui.state import EditorState
+    from animengine.ui.tools import SelectTool, ToolEvent
+
+    state = EditorState()
+    p = state.project
+    p.add_rect(30, 90, 240, 210)
+    p.fill_region(150, 200, "#57cc7a")
+    p.add_rect(270, 210, 300, 200)
+    p.fill_region(420, 310, "#e63946")
+    p.add_polyline([(430, 40), (460, 60), (300, 170), (270, 150)], close=True)
+    p.fill_region(370, 100, "#8b5a2b")
+
+    tool = SelectTool(state)
+
+    def ev(x, y):
+        return ToolEvent(pos=Vec2(x, y))
+
+    tool.press(ev(370, 100))
+    for i in range(1, 7):
+        t = i / 6
+        tool.move(ev(370 + (280 - 370) * t, 100 + (260 - 100) * t))
+    tool.release(ev(280, 260))
+
+    shape = p.active_layer.keyframes[0].shape
+    colors = sorted(f.color.to_hex() for f in shape.fills.values())
+    # stick + at least one green and one red piece; pieces on both sides
+    assert "#8b5a2b" in colors
+    assert colors.count("#57cc7a") >= 1 and colors.count("#e63946") >= 2
+    # green body is intact (not deformed): its interior still green
+    greens = [f for f in shape.fills.values() if f.color.to_hex() == "#57cc7a"]
+    assert any(shape.fill_contains(g, Vec2(100, 150)) for g in greens)
+    assert any(shape.fill_contains(g, Vec2(60, 280)) for g in greens)
+    # red main body + its cut-off corner piece both red
+    reds = [f for f in shape.fills.values() if f.color.to_hex() == "#e63946"]
+    assert any(shape.fill_contains(r, Vec2(500, 300)) for r in reds)

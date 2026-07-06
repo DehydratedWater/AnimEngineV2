@@ -520,15 +520,28 @@ class SelectTool(Tool):
                      if shape.fill_contains(f, ev.pos)), None)
         if fill is not None:
             session = self.project.edit_shape()
-            ids = set()
-            for cid in fill.connection_ids():
-                c = session.shape.connections.get(cid)
+            live = session.shape
+            live_fill = live.fills[fill.id]
+            fill_conns = set(live_fill.connection_ids())
+            idx = live.index()
+            ids: set[int] = set()
+            for cid in fill_conns:
+                c = live.connections.get(cid)
                 if c:
                     ids |= {c.p1, c.p2, *c.control_ids()}
-            ids = _with_attached_controls(session.shape, ids)
+            # Flash-style: rip the fill free of geometry welded onto its
+            # boundary, so dragging it never deforms the shapes it touched
+            for pid in list(ids):
+                p = live.points.get(pid)
+                if p is None or p.is_control:
+                    continue
+                if idx.adjacency.get(pid, set()) - fill_conns:
+                    ids.discard(pid)
+                    ids.add(live.detach_point(pid, fill_conns))
+            ids = _with_attached_controls(live, ids)
             self.drag = _DragState("fill", ev.pos, session,
                                    extra={"ids": ids, "last": ev.pos})
-            self._mark_drag(session.shape, ids)
+            self._mark_drag(live, ids)
             return
         # 3. empty space: marquee
         if not ev.ctrl:

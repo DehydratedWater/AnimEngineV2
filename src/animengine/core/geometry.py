@@ -254,6 +254,34 @@ def point_in_polygon(p: Vec2, poly: Sequence[Vec2]) -> bool:
     return inside
 
 
+def polygon_interior_point(poly: Sequence[Vec2]) -> Vec2 | None:
+    """A point strictly inside a (possibly concave) polygon.
+
+    Scans a horizontal line through the vertical middle band and takes the
+    midpoint of the first crossing span; falls back to other bands if the
+    polygon is degenerate there.
+    """
+    if len(poly) < 3:
+        return None
+    ys = sorted({p.y for p in poly})
+    bands = [(ys[i] + ys[i + 1]) / 2 for i in range(len(ys) - 1)
+             if ys[i + 1] - ys[i] > 1e-9]
+    # try middle bands first (most likely to be wide)
+    bands.sort(key=lambda y: abs(y - (ys[0] + ys[-1]) / 2))
+    n = len(poly)
+    for y in bands:
+        xs: list[float] = []
+        for i in range(n):
+            a, b = poly[i], poly[(i + 1) % n]
+            if (a.y > y) != (b.y > y):
+                xs.append(a.x + (y - a.y) / (b.y - a.y) * (b.x - a.x))
+        xs.sort()
+        for j in range(0, len(xs) - 1, 2):
+            if xs[j + 1] - xs[j] > 1e-6:
+                return Vec2((xs[j] + xs[j + 1]) / 2, y)
+    return None
+
+
 def polygon_area(poly: Sequence[Vec2]) -> float:
     """Signed area (positive = counter-clockwise in y-down coordinates: clockwise visually)."""
     s = 0.0
