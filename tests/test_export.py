@@ -117,3 +117,24 @@ def test_export_webm(doc, tmp_path):
 def test_probe_duration():
     d = probe_duration(make_wav(0.5), "wav")
     assert d is not None and abs(d - 0.5) < 0.05
+
+
+@pytest.mark.skipif(not have_ffmpeg(), reason="ffmpeg unavailable")
+def test_load_audio_clip(doc, tmp_path):
+    from animengine.audio import load_audio_clip
+
+    wav_path = tmp_path / "tone.wav"
+    wav_path.write_bytes(make_wav(1.0))
+    clip = load_audio_clip(doc, wav_path, start_frame=2, gain=0.5)
+    assert clip.name == "tone" and clip.gain == 0.5
+    assert clip.duration_sec is not None and abs(clip.duration_sec - 1.0) < 0.05
+    assert doc.length >= 2 + int(clip.duration_sec * doc.fps)
+
+
+def test_load_audio_rejects_unknown(doc, tmp_path):
+    from animengine.audio import load_audio_clip
+
+    bad = tmp_path / "file.xyz"
+    bad.write_bytes(b"nope")
+    with pytest.raises(ValueError):
+        load_audio_clip(doc, bad)
