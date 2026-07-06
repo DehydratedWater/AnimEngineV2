@@ -163,3 +163,65 @@ def test_fill_outer_ring_skips_island_inside_hole():
     assert img.pixelColor(30, 30).red() == 255      # ring red
     assert img.pixelColor(90, 90).green() == 255    # hole white
     assert img.pixelColor(140, 140).green() == 255  # island interior stays white
+
+
+def _drag_fill(state, frm, to):
+    from animengine.ui.tools import SelectTool, ToolEvent
+
+    tool = SelectTool(state)
+
+    def ev(x, y, **kw):
+        return ToolEvent(pos=Vec2(x, y), **kw)
+
+    tool.press(ev(*frm))
+    tool.move(ev(*to))
+    tool.release(ev(*to))
+    return tool
+
+
+def test_drop_merge_consumes_hidden_corner():
+    """User report: green dropped over red must destroy red's covered corner
+    point/edges; red keeps only its visible remainder (Flash semantics)."""
+    from animengine.ui.state import EditorState
+
+    state = EditorState()
+    p = state.project
+    # red first (below), green second
+    p.add_rect(200, 150, 300, 200)
+    p.fill_region(350, 250, "#e63946")
+    p.add_rect(600, 150, 240, 160)
+    p.fill_region(700, 230, "#57cc7a")
+    shape = p.active_layer.keyframes[0].shape
+    # drag green fill so it covers red's top-right corner region
+    _drag_fill(state, (700, 230), (450, 120))  # green now spans ~(350,40)-(590,200)
+    shape = p.active_layer.keyframes[0].shape
+    # red's original top-right corner (500,150) is covered -> the point is gone
+    covered_corner = [pt for pt in shape.anchor_points()
+                      if pt.pos.distance_to(Vec2(500, 150)) < 1.0]
+    assert covered_corner == [], "hidden corner point survived the drop"
+    # both fills exist; green is on top of the draw order
+    assert len(shape.fills) == 2
+    fills = list(shape.fills.values())
+    green = fills[-1]
+    assert green.color == Color(0x57, 0xCC, 0x7A)
+    red = fills[0]
+    # red no longer covers the overlap; still covers its remaining body
+    assert not shape.fill_contains(red, Vec2(480, 170))
+    assert shape.fill_contains(red, Vec2(300, 250))
+    assert shape.fill_contains(green, Vec2(480, 170))
+
+
+def test_drop_merge_spares_preexisting_decorations():
+    """Reshaping a fill must NOT eat strokes that were already inside it."""
+    from animengine.ui.state import EditorState
+
+    state = EditorState()
+    p = state.project
+    p.add_rect(100, 100, 200, 200)
+    p.fill_region(200, 200, "#ffcc00")
+    p.add_line(150, 180, 250, 180, snap=False)  # an "eye" inside the fill
+    shape = p.active_layer.keyframes[0].shape
+    before = len(shape.connections)
+    _drag_fill(state, (200, 260), (208, 266))  # nudge the fill slightly
+    shape = p.active_layer.keyframes[0].shape
+    assert len(shape.connections) == before, "decoration stroke was eaten"

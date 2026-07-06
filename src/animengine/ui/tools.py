@@ -675,12 +675,33 @@ class SelectTool(Tool):
             moved = d.extra["ids"]
         else:  # move / scale / rotate via the transform box
             moved = set(d.extra["originals"])
-        moved_conns = _conns_of_points(d.session.shape, moved)
-        d.session.shape.insert_intersections(list(moved_conns))
+        shape = d.session.shape
+        moved_conns = _conns_of_points(shape, moved)
+        shape.insert_intersections(list(moved_conns))
+        self._drop_merge(shape, moved, d.session.before_shape)
         d.session.commit(label)
         if d.mode in ("move", "scale", "rotate"):
             state.recompute_selection_box()
         state.notify()
+
+    @staticmethod
+    def _drop_merge(shape, moved_point_ids: set[int], before) -> None:
+        """Flash-style drop: fills that moved come to the front and consume
+        the geometry they newly cover; half-covered fills keep their visible
+        remainder."""
+        alive = {pid for pid in moved_point_ids if pid in shape.points}
+        moved_conns = _conns_of_points(shape, alive)
+        moved_fills = [fid for fid, f in shape.fills.items()
+                       if f.connection_ids() & moved_conns]
+        if not moved_fills:
+            return
+        spare: set[int] = set()
+        for fid in moved_fills:
+            spare |= shape.fills[fid].connection_ids()
+        for fid in moved_fills:
+            shape.raise_fill(fid)
+        for fid in moved_fills:
+            shape.consume_under_fill(fid, spare=spare, before=before)
 
     def _select_rect(self, x0: float, y0: float, x1: float, y1: float,
                      additive: bool) -> None:

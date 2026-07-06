@@ -642,15 +642,19 @@ class Shape:
         return created
 
     # ------------------------------------------------------- fill trace
-    def detect_region(self, pos: Vec2) -> list[list[FillEdge]] | None:
+    def detect_region(self, pos: Vec2,
+                      faces: list[list[FillEdge]] | None = None,
+                      ) -> list[list[FillEdge]] | None:
         """Find the enclosed region containing pos (bucket-fill target).
 
         Builds directed half-edges over anchor points, traces face cycles by
         always taking the most-clockwise outgoing edge, then picks the
         smallest-area face containing pos. Returns boundary loops (outline
         first, then any hole loops), or None if pos is not enclosed.
+        Pass precomputed *faces* (from _trace_faces) to amortize repeat calls.
         """
-        faces = self._trace_faces()
+        if faces is None:
+            faces = self._trace_faces()
         best: tuple[float, list[FillEdge], list[Vec2]] | None = None
         for cycle in faces:
             poly = self._cycle_polygon(cycle)
@@ -687,6 +691,122 @@ class Shape:
             if not nested:
                 loops.append(cycle)
         return loops
+
+    # -------------------------------------------------- drop-merge (Flash)
+    def raise_fill(self, fill_id: int) -> None:
+        """Bring a fill to the top of the draw order (last drawn)."""
+        f = self.fills.pop(fill_id, None)
+        if f is not None:
+            self.fills[fill_id] = f
+            self.touch()
+
+    def connection_midpoint(self, conn: Connection) -> Vec2:
+        """Geometric midpoint of a connection (t=0.5 along the curve)."""
+        pts = self.sample_connection(conn, samples=8)
+        if len(pts) == 2:
+            return pts[0].lerp(pts[1], 0.5)
+        return pts[len(pts) // 2]
+
+    def _fill_boundary_distance(self, f: Fill, p: Vec2) -> float:
+        best = math.inf
+        for loop in f.loops:
+            for e in loop:
+                conn = self.connections.get(e.conn_id)
+                if conn is None:
+                    continue
+                pts = self.sample_connection(conn, samples=8)
+                for i in range(len(pts) - 1):
+                    best = min(best, point_segment_distance(p, pts[i], pts[i + 1]))
+        return best
+
+    def interior_samples(self, f: Fill, grid: int = 7) -> list[Vec2]:
+        """Points strictly inside a fill, spread over its bbox (for re-tracing)."""
+        loops = self.fill_polygon(f)
+        if not loops or len(loops[0]) < 3:
+            return []
+        outline = loops[0]
+        xs = [p.x for p in outline]
+        ys = [p.y for p in outline]
+        out: list[Vec2] = []
+        for i in range(1, grid + 1):
+            for j in range(1, grid + 1):
+                p = Vec2(min(xs) + (max(xs) - min(xs)) * i / (grid + 1),
+                         min(ys) + (max(ys) - min(ys)) * j / (grid + 1))
+                crossings = sum(point_in_polygon(p, loop) for loop in loops
+                                if len(loop) >= 3)
+                if crossings % 2 == 1 and self._fill_boundary_distance(f, p) > 1.5:
+                    out.append(p)
+        return out
+
+    def consume_under_fill(self, fill_id: int, spare: set[int] | None = None,
+                           before: Shape | None = None) -> int:
+        """Flash-style drop merge: destroy geometry newly covered by this fill.
+
+        Deletes every connection lying strictly inside the fill's region
+        (except its own boundary and *spare* connections, e.g. other fills
+        dropped in the same drag). If *before* (the pre-drag shape) is given,
+        connections that were already covered by this same fill before the
+        drag are preserved — so decorations drawn inside a shape survive
+        reshaping it. Fills that lose boundary connections are re-traced to
+        their still-visible remainder regions. Returns connections consumed.
+        """
+        top = self.fills.get(fill_id)
+        if top is None:
+            return 0
+        spare = spare or set()
+        boundary = top.connection_ids()
+        loops_poly = self.fill_polygon(top)
+        if not loops_poly or len(loops_poly[0]) < 3:
+            return 0
+        xs = [p.x for loop in loops_poly for p in loop]
+        ys = [p.y for loop in loops_poly for p in loop]
+        before_fill = before.fills.get(fill_id) if before is not None else None
+        doomed: list[int] = []
+        for cid in self.index().conns_in_rect(min(xs), min(ys), max(xs), max(ys)):
+            if cid in boundary or cid in spare:
+                continue
+            conn = self.connections.get(cid)
+            if conn is None:
+                continue
+            mid = self.connection_midpoint(conn)
+            if not self.fill_contains(top, mid):
+                continue
+            if self._fill_boundary_distance(top, mid) < 0.5:
+                continue  # hugging the boundary: treat as shared edge
+            if before_fill is not None and cid in before.connections:
+                b_mid = before.connection_midpoint(before.connections[cid])
+                if before.fill_contains(before_fill, b_mid):
+                    continue  # was already inside before the drag: keep it
+            doomed.append(cid)
+        if not doomed:
+            return 0
+        doomed_set = set(doomed)
+        # capture colors + interior sample points of fills about to lose edges
+        damaged: list[tuple[Color, list[Vec2]]] = []
+        for f in list(self.fills.values()):
+            if f.id != fill_id and doomed_set & f.connection_ids():
+                damaged.append((f.color, self.interior_samples(f)))
+        for cid in doomed:
+            self.remove_connection(cid)
+        # re-trace the visible remainders of the damaged fills
+        if damaged:
+            faces = self._trace_faces()
+            for color, samples in damaged:
+                seen: set[frozenset] = set()
+                for pt in samples:
+                    if self.fill_contains(top, pt):
+                        continue  # covered part is gone by definition
+                    loops = self.detect_region(pt, faces=faces)
+                    if not loops:
+                        continue
+                    key = frozenset(e.conn_id for e in loops[0])
+                    if key in seen or key == frozenset(
+                            e.conn_id for e in top.loops[0]):
+                        continue
+                    seen.add(key)
+                    self.add_fill(loops, color)
+            self.raise_fill(fill_id)  # dropped fill stays on top of remainders
+        return len(doomed)
 
     def _cycle_polygon(self, cycle: list[FillEdge]) -> list[Vec2]:
         poly: list[Vec2] = []

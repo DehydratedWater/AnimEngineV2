@@ -29,6 +29,11 @@ class ShapeEditSession:
     def shape(self) -> Shape:
         return self.keyframe.shape
 
+    @property
+    def before_shape(self) -> Shape | None:
+        """The shape as it was when the session started (None if new keyframe)."""
+        return self._before
+
     def commit(self, label: str) -> None:
         if self._done:
             return
