@@ -14,6 +14,7 @@ from typing import Any
 
 from animengine.audio import load_audio_clip
 from animengine.core import (
+    BLACK,
     Color,
     Command,
     Document,
@@ -39,7 +40,7 @@ from animengine.io.export import (
 SNAP_RADIUS = 15.0  # v1's screen-space snap radius, in document px
 
 
-def _color(c: str | Color | None, default: Color = Color(0, 0, 0)) -> Color:
+def _color(c: str | Color | None, default: Color = BLACK) -> Color:
     if c is None:
         return default
     if isinstance(c, Color):
