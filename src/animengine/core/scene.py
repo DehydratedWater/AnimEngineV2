@@ -184,17 +184,22 @@ class Shape:
         self.connections[cid] = c
         return c
 
+    def _endpoint_pair(self, a: Vec2, b: Vec2, snap_radius: float) -> tuple[Point, Point]:
+        """Resolve both endpoints of a new stroke; the end never snaps onto the
+        freshly created start (v1 committed both together, so it couldn't)."""
+        p1 = self.find_or_add_point(a, snap_radius)
+        p2 = self.find_or_add_point(b, snap_radius, exclude={p1.id})
+        return p1, p2
+
     def add_line(self, a: Vec2, b: Vec2, *, width: float = 3.0, color: Color = BLACK,
                  snap_radius: float = 0.0) -> Connection:
         """Convenience: create a line between two positions, snapping to existing points."""
-        p1 = self.find_or_add_point(a, snap_radius)
-        p2 = self.find_or_add_point(b, snap_radius)
+        p1, p2 = self._endpoint_pair(a, b, snap_radius)
         return self.add_connection(p1.id, p2.id, width=width, color=color)
 
     def add_quad_curve(self, a: Vec2, ctrl: Vec2, b: Vec2, *, width: float = 3.0,
                        color: Color = BLACK, snap_radius: float = 0.0) -> Connection:
-        p1 = self.find_or_add_point(a, snap_radius)
-        p2 = self.find_or_add_point(b, snap_radius)
+        p1, p2 = self._endpoint_pair(a, b, snap_radius)
         cp = self.add_point(ctrl, is_control=True, anchor=p1.id)
         return self.add_connection(p1.id, p2.id, kind=ConnKind.QUAD, c1=cp.id,
                                    width=width, color=color)
@@ -202,8 +207,7 @@ class Shape:
     def add_cubic_curve(self, a: Vec2, ctrl1: Vec2, ctrl2: Vec2, b: Vec2, *,
                         width: float = 3.0, color: Color = BLACK,
                         snap_radius: float = 0.0) -> Connection:
-        p1 = self.find_or_add_point(a, snap_radius)
-        p2 = self.find_or_add_point(b, snap_radius)
+        p1, p2 = self._endpoint_pair(a, b, snap_radius)
         cp1 = self.add_point(ctrl1, is_control=True, anchor=p1.id)
         cp2 = self.add_point(ctrl2, is_control=True, anchor=p2.id)
         return self.add_connection(p1.id, p2.id, kind=ConnKind.CUBIC, c1=cp1.id, c2=cp2.id,
@@ -217,9 +221,11 @@ class Shape:
         self.fills[fid] = f
         return f
 
-    def find_or_add_point(self, pos: Vec2, snap_radius: float = 0.0) -> Point:
+    def find_or_add_point(self, pos: Vec2, snap_radius: float = 0.0,
+                          exclude: set[int] | None = None) -> Point:
         if snap_radius > 0:
-            hit = self.nearest_point(pos, max_dist=snap_radius, include_controls=False)
+            hit = self.nearest_point(pos, max_dist=snap_radius, include_controls=False,
+                                     exclude=exclude)
             if hit is not None:
                 return hit
         return self.add_point(pos)
@@ -360,10 +366,13 @@ class Shape:
         return [cubic_bezier(a, c1p, c2p, b, i / samples) for i in range(samples + 1)]
 
     def nearest_point(self, pos: Vec2, max_dist: float = math.inf,
-                      include_controls: bool = True) -> Point | None:
+                      include_controls: bool = True,
+                      exclude: set[int] | None = None) -> Point | None:
         best, best_d = None, max_dist
         for p in self.points.values():
             if not include_controls and p.is_control:
+                continue
+            if exclude is not None and p.id in exclude:
                 continue
             d = p.pos.distance_to(pos)
             if d < best_d:
