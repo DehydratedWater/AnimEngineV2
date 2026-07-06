@@ -27,9 +27,18 @@ from animengine.api import SNAP_RADIUS
 from animengine.core import Vec2
 from animengine.core.layers import RasterLayer, VectorLayer
 
-from .state import EditorState
+from .state import ActiveDrag, EditorState
 
 _OVERLAY_BLUE = QColor(60, 120, 255)
+
+
+def _conns_of_points(shape, point_ids) -> set[int]:
+    """All connections touching any of the given points (index-accelerated)."""
+    idx = shape.index()
+    out: set[int] = set()
+    for pid in point_ids:
+        out |= idx.adjacency.get(pid, set())
+    return out
 
 
 @dataclass
@@ -394,8 +403,10 @@ class EraserTool(Tool):
 
     def _erase(self, ev: ToolEvent) -> None:
         shape = self.session.shape
-        doomed = [p.id for p in shape.anchor_points()
-                  if p.pos.distance_to(ev.pos) <= self.state.eraser_radius]
+        r = self.state.eraser_radius
+        doomed = [p.id for p in shape.points_in_rect(ev.pos.x - r, ev.pos.y - r,
+                                                     ev.pos.x + r, ev.pos.y + r)
+                  if p.pos.distance_to(ev.pos) <= r]
         for pid in doomed:
             shape.remove_point(pid)
 
@@ -485,6 +496,7 @@ class SelectTool(Tool):
         if pt is not None:
             session = self.project.edit_shape()
             self.drag = _DragState("point", ev.pos, session, pt.id)
+            self._mark_drag(session.shape, {pt.id})
             return
         conn = shape.nearest_connection(ev.pos, max_dist=ev.hit_radius())
         if conn is not None:
@@ -492,6 +504,7 @@ class SelectTool(Tool):
             ids = {conn.p1, conn.p2, *conn.control_ids()}
             self.drag = _DragState("conn", ev.pos, session,
                                    extra={"ids": ids, "last": ev.pos})
+            self._mark_drag(session.shape, ids)
             return
         fill = next((f for f in shape.fills.values()
                      if shape.fill_contains(f, ev.pos)), None)
@@ -504,6 +517,7 @@ class SelectTool(Tool):
                     ids |= {c.p1, c.p2, *c.control_ids()}
             self.drag = _DragState("fill", ev.pos, session,
                                    extra={"ids": ids, "last": ev.pos})
+            self._mark_drag(session.shape, ids)
             return
         # 3. empty space: marquee
         if not ev.ctrl:
@@ -530,6 +544,11 @@ class SelectTool(Tool):
         self.drag = _DragState(mode, ev.pos, session,
                                extra={"anchor": anchor, "box0": box,
                                       "originals": originals})
+        self._mark_drag(shape, set(originals))
+
+    def _mark_drag(self, shape, point_ids: set[int]) -> None:
+        """Tell the canvas which connections move so it can cache the rest."""
+        self.state.active_drag = ActiveDrag(shape, _conns_of_points(shape, point_ids))
 
     def move(self, ev: ToolEvent) -> None:
         d = self.drag
@@ -605,6 +624,7 @@ class SelectTool(Tool):
     def release(self, ev: ToolEvent) -> None:
         d = self.drag
         self.drag = None
+        self.state.active_drag = None
         if d is None:
             return
         state = self.state
@@ -638,7 +658,13 @@ class SelectTool(Tool):
                 if target is not None:
                     shape.merge_points(target.id, p.id)
         if d.mode in ("point", "conn", "fill"):
-            d.session.shape.insert_intersections()
+            moved = (
+                {d.point_id, *(c.id for c in d.session.shape.controls_of(d.point_id))}
+                if d.mode == "point"
+                else d.extra["ids"]
+            )
+            moved_conns = _conns_of_points(d.session.shape, moved)
+            d.session.shape.insert_intersections(list(moved_conns))
         d.session.commit(label)
         if d.mode in ("move", "scale", "rotate"):
             state.recompute_selection_box()
@@ -662,9 +688,8 @@ class SelectTool(Tool):
             return
         if not additive:
             state.selected_points.clear()
-        for p in shape.anchor_points():
-            if x0 <= p.pos.x <= x1 and y0 <= p.pos.y <= y1:
-                state.selected_points.add(p.id)
+        for p in shape.points_in_rect(x0, y0, x1, y1):
+            state.selected_points.add(p.id)
         state.recompute_selection_box()
         state.notify()
 
@@ -687,6 +712,7 @@ class SelectTool(Tool):
             self.drag.session.cancel()
         self.drag = None
         self.marquee_end = None
+        self.state.active_drag = None
         self.state.clear_selection()
         self.state.notify()
 
@@ -695,6 +721,7 @@ class SelectTool(Tool):
             self.drag.session.cancel()
         self.drag = None
         self.marquee_end = None
+        self.state.active_drag = None
 
     def draw_overlay(self, painter, to_screen) -> None:
         d = self.drag

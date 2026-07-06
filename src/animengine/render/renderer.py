@@ -120,21 +120,63 @@ def fill_path(shape: Shape, fill) -> QPainterPath | None:
 
 # ------------------------------------------------------------ painting
 def paint_shape(painter: QPainter, shape: Shape, *, antialias: bool = True,
-                stroke_scale: float = 1.0) -> None:
-    """Draw one vector shape: fills first, then strokes (v1 draw order)."""
+                stroke_scale: float = 1.0,
+                skip_conns: set[int] | None = None,
+                only_conns: set[int] | None = None) -> None:
+    """Draw one vector shape: fills first, then strokes (v1 draw order).
+
+    Strokes are batched into one QPainterPath per (color, width) group, which
+    keeps huge hand-drawn scenes fast (few pen switches, few draw calls).
+    skip_conns/only_conns split a shape into static/dynamic halves while a
+    drag is in progress (a fill touching the given set counts as dynamic).
+    """
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, antialias)
+
+    def _included(conn_ids: set[int]) -> bool:
+        if skip_conns is not None and conn_ids & skip_conns:
+            return False
+        if only_conns is not None and not (conn_ids & only_conns):
+            return False
+        return True
+
     for f in shape.fills.values():
+        if not _included(f.connection_ids()):
+            continue
         path = fill_path(shape, f)
         if path is not None:
             painter.fillPath(path, qcolor(f.color))
+
+    groups: dict[tuple, QPainterPath] = {}
+    pts = shape.points
     for conn in shape.connections.values():
         if conn.only_shape:
             continue
-        pen = QPen(qcolor(conn.color), conn.width * stroke_scale)
+        if skip_conns is not None and conn.id in skip_conns:
+            continue
+        if only_conns is not None and conn.id not in only_conns:
+            continue
+        key = (conn.color.r, conn.color.g, conn.color.b, conn.color.a, conn.width)
+        path = groups.get(key)
+        if path is None:
+            path = groups[key] = QPainterPath()
+        a = pts[conn.p1].pos
+        b = pts[conn.p2].pos
+        path.moveTo(a.x, a.y)
+        if conn.kind is ConnKind.LINE:
+            path.lineTo(b.x, b.y)
+        elif conn.kind is ConnKind.QUAD:
+            c = pts[conn.c1].pos
+            path.quadTo(c.x, c.y, b.x, b.y)
+        else:
+            c1 = pts[conn.c1].pos
+            c2 = pts[conn.c2].pos
+            path.cubicTo(c1.x, c1.y, c2.x, c2.y, b.x, b.y)
+    for (r, g, b_, a_, width), path in groups.items():
+        pen = QPen(QColor(r, g, b_, a_), width * stroke_scale)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
-        painter.drawPath(connection_path(shape, conn.id))
+        painter.drawPath(path)
 
 
 def paint_raster(painter: QPainter, image: RasterImage, placement: Placement,

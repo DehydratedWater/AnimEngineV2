@@ -146,7 +146,7 @@ class Document:
         if isinstance(layer, VectorLayer):
             shape = layer.shape_at(from_frame)
             if shape is not None:
-                layer.set_keyframe(to_frame, shape)
+                layer.set_keyframe(to_frame, shape.clone())
         elif isinstance(layer, RasterLayer):
             state = layer.state_at(from_frame)
             if state is not None:

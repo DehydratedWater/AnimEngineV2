@@ -68,6 +68,7 @@ class _ShapeEdit(Command):
         self._before = kf.shape.clone() if kf else None
         kf = self._layer.ensure_keyframe(self._frame)
         result = self._fn(kf.shape)
+        kf.shape.touch()  # direct attribute writes in fn still invalidate caches
         self._after = kf.shape.clone()
         return result
 
@@ -473,7 +474,7 @@ class AnimProject:
                 v = Vec2(v.x * scale_x, v.y * scale_y)
                 if rotate_deg:
                     v = v.rotated(math.radians(rotate_deg))
-                p.pos = center + v + Vec2(dx, dy)
+                shape.move_point(p.id, center + v + Vec2(dx, dy))
 
         self._edit("Transform points", fn, layer_id, frame)
 
@@ -542,7 +543,9 @@ class AnimProject:
         pos = Vec2(x, y)
 
         def fn(shape: Shape) -> int:
-            doomed = [p.id for p in shape.anchor_points()
+            doomed = [p.id for p in shape.points_in_rect(
+                          pos.x - radius, pos.y - radius,
+                          pos.x + radius, pos.y + radius)
                       if p.pos.distance_to(pos) <= radius]
             for pid in doomed:
                 shape.remove_point(pid)

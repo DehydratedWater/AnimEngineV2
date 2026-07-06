@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 from animengine.api import AnimProject
 from animengine.core import Color
+
+
+@dataclass
+class ActiveDrag:
+    """Marks a subset of a shape as 'in motion' during an interactive drag."""
+
+    shape: Any  # the Shape being mutated live
+    conns: set[int] = field(default_factory=set)  # connections that move
+    token: object = field(default_factory=object)  # identity for cache keying
 
 
 class EditorState:
@@ -22,6 +33,9 @@ class EditorState:
         # selection (point/connection/fill ids on the active layer's current frame)
         self.selected_points: set[int] = set()
         self.selection_box: tuple[float, float, float, float] | None = None
+        # live drag (set by tools): lets the canvas split the active layer
+        # into a cached static picture + the few connections being dragged
+        self.active_drag: ActiveDrag | None = None
         # view toggles
         self.show_points = True
         self.onion_skin = False

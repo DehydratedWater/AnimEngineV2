@@ -130,6 +130,13 @@ class Shape:
         self._next_point = 1
         self._next_conn = 1
         self._next_fill = 1
+        #: bumped on every mutation; render caches key off this
+        self.epoch = 0
+        self._index: _SpatialIndex | None = None
+
+    def touch(self) -> None:
+        """Mark the shape as changed (invalidates render caches)."""
+        self.epoch += 1
 
     # ------------------------------------------------------------- basics
     def clone(self) -> Shape:
@@ -141,6 +148,13 @@ class Shape:
         s._next_conn = self._next_conn
         s._next_fill = self._next_fill
         return s
+
+    # ------------------------------------------------------ spatial index
+    def index(self) -> _SpatialIndex:
+        """Lazy spatial index; maintained incrementally by all mutators."""
+        if self._index is None:
+            self._index = _SpatialIndex(self)
+        return self._index
 
     def is_empty(self) -> bool:
         return not self.points and not self.connections and not self.fills
@@ -161,6 +175,9 @@ class Shape:
         self._next_point = max(self._next_point, pid + 1)
         p = Point(pid, pos, is_control, anchor)
         self.points[pid] = p
+        self.touch()
+        if self._index is not None:
+            self._index.add_point(p)
         return p
 
     def add_connection(
@@ -182,6 +199,9 @@ class Shape:
         self._next_conn = max(self._next_conn, cid + 1)
         c = Connection(cid, p1, p2, kind, c1, c2, width, color, only_shape)
         self.connections[cid] = c
+        self.touch()
+        if self._index is not None:
+            self._index.add_conn(c)
         return c
 
     def _endpoint_pair(self, a: Vec2, b: Vec2, snap_radius: float) -> tuple[Point, Point]:
@@ -219,6 +239,7 @@ class Shape:
         self._next_fill = max(self._next_fill, fid + 1)
         f = Fill(fid, loops, color)
         self.fills[fid] = f
+        self.touch()
         return f
 
     def find_or_add_point(self, pos: Vec2, snap_radius: float = 0.0,
@@ -231,33 +252,51 @@ class Shape:
         return self.add_point(pos)
 
     # ------------------------------------------------------------ delete
+    def _del_point(self, point_id: int) -> None:
+        p = self.points.pop(point_id, None)
+        if p is not None:
+            self.touch()
+            if self._index is not None:
+                self._index.remove_point(p)
+
     def remove_connection(self, conn_id: int, *, prune_points: bool = True) -> None:
         conn = self.connections.pop(conn_id, None)
         if conn is None:
             return
+        self.touch()
+        if self._index is not None:
+            self._index.remove_conn(conn_id, conn)
         for fid in [f.id for f in self.fills.values() if conn_id in f.connection_ids()]:
             del self.fills[fid]
         if prune_points:
             for pid in [conn.p1, conn.p2]:
                 if pid in self.points and not self._point_used(pid):
-                    del self.points[pid]
+                    self._del_point(pid)
             for pid in conn.control_ids():
-                self.points.pop(pid, None)
+                self._del_point(pid)
 
     def remove_point(self, point_id: int) -> None:
         """Remove a point and every connection using it (fills referencing those die too)."""
         p = self.points.get(point_id)
         if p is None:
             return
-        for cid in [c.id for c in self.connections.values()
-                    if point_id in (c.p1, c.p2) or point_id in c.control_ids()]:
+        for cid in self._conns_of_point(point_id):
             self.remove_connection(cid)
-        self.points.pop(point_id, None)
+        self._del_point(point_id)
 
     def remove_fill(self, fill_id: int) -> None:
-        self.fills.pop(fill_id, None)
+        if self.fills.pop(fill_id, None) is not None:
+            self.touch()
+
+    def _conns_of_point(self, point_id: int) -> list[int]:
+        if self._index is not None:
+            return list(self._index.adjacency.get(point_id, ()))
+        return [c.id for c in self.connections.values()
+                if point_id in (c.p1, c.p2) or point_id in c.control_ids()]
 
     def _point_used(self, point_id: int) -> bool:
+        if self._index is not None:
+            return bool(self._index.adjacency.get(point_id))
         return any(
             point_id in (c.p1, c.p2) or point_id in c.control_ids()
             for c in self.connections.values()
@@ -265,13 +304,23 @@ class Shape:
 
     # ------------------------------------------------------------ edit
     def move_point(self, point_id: int, pos: Vec2) -> None:
-        self.points[point_id].pos = pos
+        p = self.points[point_id]
+        p.pos = pos
+        self.touch()
+        if self._index is not None:
+            self._index.move_point(p)
 
     def merge_points(self, keep_id: int, remove_id: int) -> None:
         """Weld remove_id into keep_id, rewiring all connections."""
         if keep_id == remove_id or remove_id not in self.points:
             return
-        for c in self.connections.values():
+        affected = self._conns_of_point(remove_id)
+        for cid in affected:
+            c = self.connections.get(cid)
+            if c is None:
+                continue
+            if self._index is not None:
+                self._index.remove_conn(cid)
             if c.p1 == remove_id:
                 c.p1 = keep_id
             if c.p2 == remove_id:
@@ -280,13 +329,25 @@ class Shape:
                 c.c1 = keep_id
             if c.c2 == remove_id:
                 c.c2 = keep_id
-        for p in self.points.values():
-            if p.anchor == remove_id:
-                p.anchor = keep_id
+            if self._index is not None:
+                self._index.add_conn(c)
+        if self._index is not None:
+            ctrl_ids = list(self._index.controls.pop(remove_id, set()))
+        else:
+            ctrl_ids = [p.id for p in self.points.values() if p.anchor == remove_id]
+        for ctrl_pid in ctrl_ids:
+            ctrl = self.points.get(ctrl_pid)
+            if ctrl is not None:
+                ctrl.anchor = keep_id
+                if self._index is not None:
+                    self._index.controls.setdefault(keep_id, set()).add(ctrl_pid)
         # degenerate connections (both ends welded together) die
-        for cid in [c.id for c in self.connections.values() if c.p1 == c.p2]:
-            self.remove_connection(cid, prune_points=False)
-        del self.points[remove_id]
+        for cid in affected:
+            c = self.connections.get(cid)
+            if c is not None and c.p1 == c.p2:
+                self.remove_connection(cid, prune_points=False)
+        self._del_point(remove_id)
+        self.touch()
 
     def split_connection(self, conn_id: int, pos: Vec2) -> tuple[Point, Connection, Connection]:
         """Split a connection at (approximately) pos; returns (new point, part1, part2).
@@ -332,8 +393,11 @@ class Shape:
         # old control points of the split connection are gone
         old_controls = conn.control_ids()
         del self.connections[conn.id]
+        self.touch()
+        if self._index is not None:
+            self._index.remove_conn(conn.id, conn)
         for pid in old_controls:
-            self.points.pop(pid, None)
+            self._del_point(pid)
         return mid, n1, n2
 
     def _replace_in_fills(self, conn_id: int, parts: list[Connection]) -> None:
@@ -369,7 +433,14 @@ class Shape:
                       include_controls: bool = True,
                       exclude: set[int] | None = None) -> Point | None:
         best, best_d = None, max_dist
-        for p in self.points.values():
+        if math.isfinite(max_dist):
+            candidates = (self.points[pid]
+                          for pid in self.index().points_in_rect(
+                              pos.x - max_dist, pos.y - max_dist,
+                              pos.x + max_dist, pos.y + max_dist))
+        else:
+            candidates = self.points.values()
+        for p in candidates:
             if not include_controls and p.is_control:
                 continue
             if exclude is not None and p.id in exclude:
@@ -381,13 +452,32 @@ class Shape:
 
     def nearest_connection(self, pos: Vec2, max_dist: float = math.inf) -> Connection | None:
         best, best_d = None, max_dist
-        for c in self.connections.values():
+        if math.isfinite(max_dist):
+            candidates = (self.connections[cid]
+                          for cid in self.index().conns_in_rect(
+                              pos.x - max_dist, pos.y - max_dist,
+                              pos.x + max_dist, pos.y + max_dist))
+        else:
+            candidates = self.connections.values()
+        for c in candidates:
             pts = self.sample_connection(c)
             for i in range(len(pts) - 1):
                 d = point_segment_distance(pos, pts[i], pts[i + 1])
                 if d < best_d:
                     best, best_d = c, d
         return best
+
+    def points_in_rect(self, x0: float, y0: float, x1: float, y1: float,
+                       *, anchors_only: bool = True) -> list[Point]:
+        """Points inside an axis-aligned rectangle (spatial-index accelerated)."""
+        out = []
+        for pid in self.index().points_in_rect(x0, y0, x1, y1):
+            p = self.points[pid]
+            if anchors_only and p.is_control:
+                continue
+            if x0 <= p.pos.x <= x1 and y0 <= p.pos.y <= y1:
+                out.append(p)
+        return out
 
     def bounding_rect(self) -> Rect | None:
         return Rect.from_points([p.pos for p in self.points.values()])
@@ -424,38 +514,66 @@ class Shape:
         pairs are checked. Returns the number of intersection points inserted.
         """
         inserted = 0
-        # iterate until stable; splits create new connections that may cross others
-        for _ in range(256):
-            pair = self._find_one_crossing(new_conn_ids)
-            if pair is None:
-                break
-            (ca, cb, pos) = pair
-            tip_a = self._tip_point_at(ca, pos)
-            tip_b = self._tip_point_at(cb, pos)
+        # work queue of connections that may still cross something; halves
+        # created by a split are re-queued, so no full rescans are needed
+        if new_conn_ids is not None:
+            queue = list(new_conn_ids)
+        else:
+            queue = list(self.connections.keys())
+        guard = 0
+        while queue and guard < 100_000:
+            guard += 1
+            ca_id = queue.pop()
+            ca = self.connections.get(ca_id)
+            if ca is None:
+                continue
+            hit = self._first_crossing_of(ca)
+            if hit is None:
+                continue
+            cb_id, pos = hit
+            tip_a = self._tip_point_at(ca_id, pos)
+            tip_b = self._tip_point_at(cb_id, pos)
             if tip_a is not None and tip_b is not None:
                 # two strokes touching tip-to-tip: weld into one shared vertex
                 self.merge_points(tip_a, tip_b)
+                queue.append(ca_id)
             elif tip_a is not None:
                 # tip of A lands mid-way on B: split B and weld
-                _, b1, b2 = self.split_connection(cb, pos)
+                _, b1, b2 = self.split_connection(cb_id, pos)
                 self.merge_points(tip_a, b1.p2)
-                if new_conn_ids is not None and cb in new_conn_ids:
-                    new_conn_ids = [i for i in new_conn_ids if i != cb] + [b1.id, b2.id]
+                queue.append(ca_id)
             elif tip_b is not None:
-                _, a1, a2 = self.split_connection(ca, pos)
+                _, a1, a2 = self.split_connection(ca_id, pos)
                 self.merge_points(tip_b, a1.p2)
-                if new_conn_ids is not None and ca in new_conn_ids:
-                    new_conn_ids = [i for i in new_conn_ids if i != ca] + [a1.id, a2.id]
+                queue += [a1.id, a2.id]
             else:
-                _, a1, a2 = self.split_connection(ca, pos)
+                _, a1, a2 = self.split_connection(ca_id, pos)
                 mid_id = a1.p2  # shared midpoint of the two halves
-                _, b1, b2 = self.split_connection(cb, pos)
+                _, b1, b2 = self.split_connection(cb_id, pos)
                 self.merge_points(mid_id, b1.p2)
-                if new_conn_ids is not None:
-                    new_conn_ids = [i for i in new_conn_ids if i not in (ca, cb)]
-                    new_conn_ids += [a1.id, a2.id, b1.id, b2.id]
+                queue += [a1.id, a2.id]
             inserted += 1
         return inserted
+
+    def _first_crossing_of(self, ca: Connection) -> tuple[int, Vec2] | None:
+        """First crossing of *ca* against nearby connections (index query +
+        bbox precheck; curves sampled coarsely — splits refine locally)."""
+        ax0, ay0, ax1, ay1 = self._conn_bbox(ca)
+        for cb_id in self.index().conns_in_rect(ax0, ay0, ax1, ay1):
+            if cb_id == ca.id:
+                continue
+            cb = self.connections.get(cb_id)
+            if cb is None:
+                continue
+            if set(ca.endpoints()) & set(cb.endpoints()):
+                continue
+            bx0, by0, bx1, by1 = self._conn_bbox(cb)
+            if bx0 > ax1 or bx1 < ax0 or by0 > ay1 or by1 < ay0:
+                continue
+            hit = self._connections_cross(ca, cb)
+            if hit is not None:
+                return cb_id, hit
+        return None
 
     def _tip_point_at(self, conn_id: int, pos: Vec2, tol: float = 1e-3) -> int | None:
         """Endpoint id of the connection if pos coincides with one of its tips."""
@@ -466,25 +584,17 @@ class Shape:
             return c.p2
         return None
 
-    def _find_one_crossing(
-        self, restrict: list[int] | None
-    ) -> tuple[int, int, Vec2] | None:
-        conns = list(self.connections.values())
-        restrict_set = set(restrict) if restrict is not None else None
-        for i, ca in enumerate(conns):
-            for cb in conns[i + 1 :]:
-                if restrict_set is not None and ca.id not in restrict_set and cb.id not in restrict_set:
-                    continue
-                if set(ca.endpoints()) & set(cb.endpoints()):
-                    continue  # sharing an endpoint is not a crossing
-                hit = self._connections_cross(ca, cb)
-                if hit is not None:
-                    return ca.id, cb.id, hit
-        return None
+    def _conn_bbox(self, c: Connection) -> tuple[float, float, float, float]:
+        pts = [self.pos(c.p1), self.pos(c.p2)] + [self.pos(i) for i in c.control_ids()]
+        xs = [p.x for p in pts]
+        ys = [p.y for p in pts]
+        return min(xs), min(ys), max(xs), max(ys)
 
     def _connections_cross(self, ca: Connection, cb: Connection) -> Vec2 | None:
-        pa = self.sample_connection(ca)
-        pb = self.sample_connection(cb)
+        pa = self.sample_connection(ca, samples=8) if ca.kind is not ConnKind.LINE \
+            else self.sample_connection(ca)
+        pb = self.sample_connection(cb, samples=8) if cb.kind is not ConnKind.LINE \
+            else self.sample_connection(cb)
         tol = 1e-3
         for i in range(len(pa) - 1):
             for j in range(len(pb) - 1):
@@ -506,9 +616,14 @@ class Shape:
         Used by the cut-out selection (v1's default marquee slices strokes at
         the box border). Returns ids of the split points created."""
         created: list[int] = []
+        pad = 1.0
+        x0, y0 = min(a.x, b.x) - pad, min(a.y, b.y) - pad
+        x1, y1 = max(a.x, b.x) + pad, max(a.y, b.y) + pad
         for _ in range(256):
             hit = None
-            for c in list(self.connections.values()):
+            candidates = [self.connections[cid]
+                          for cid in self.index().conns_in_rect(x0, y0, x1, y1)]
+            for c in candidates:
                 pts = self.sample_connection(c)
                 for i in range(len(pts) - 1):
                     p = segment_intersection(pts[i], pts[i + 1], a, b)
@@ -653,6 +768,9 @@ class Shape:
         return [p for p in self.points.values() if not p.is_control]
 
     def controls_of(self, point_id: int) -> list[Point]:
+        if self._index is not None:
+            return [self.points[i] for i in self._index.controls.get(point_id, ())
+                    if i in self.points]
         return [p for p in self.points.values() if p.is_control and p.anchor == point_id]
 
     def stats(self) -> dict[str, int]:
@@ -661,3 +779,135 @@ class Shape:
             "connections": len(self.connections),
             "fills": len(self.fills),
         }
+
+
+class _SpatialIndex:
+    """Uniform-grid index over a Shape, maintained incrementally.
+
+    Keeps editing interactive on very large drawings (the original handled
+    scenes with enormous freehand strokes; linear scans would not):
+    - point/connection lookup by area for snapping and hit tests
+    - point -> connections adjacency (merge, delete, planarize)
+    - anchor -> control-handle mapping
+
+    Holds references to the shape's live dicts; the shape calls the mutation
+    hooks from every editing method.
+    """
+
+    CELL = 128.0
+
+    __slots__ = ("_points", "_conns", "point_cells", "point_cell_of", "conn_cells",
+                 "conn_cells_of", "adjacency", "controls", "big_conns")
+
+    def __init__(self, shape: Shape):
+        self._points = shape.points
+        self._conns = shape.connections
+        self.point_cells: dict[tuple[int, int], set[int]] = {}
+        self.point_cell_of: dict[int, tuple[int, int]] = {}
+        self.conn_cells: dict[tuple[int, int], set[int]] = {}
+        self.conn_cells_of: dict[int, list[tuple[int, int]]] = {}
+        self.adjacency: dict[int, set[int]] = {}
+        self.controls: dict[int, set[int]] = {}
+        self.big_conns: set[int] = set()
+        for p in self._points.values():
+            self.add_point(p)
+        for c in self._conns.values():
+            self.add_conn(c)
+
+    # ------------------------------------------------------------ points
+    def _cell(self, x: float, y: float) -> tuple[int, int]:
+        return (int(x // self.CELL), int(y // self.CELL))
+
+    def add_point(self, p: Point) -> None:
+        cell = self._cell(p.pos.x, p.pos.y)
+        self.point_cells.setdefault(cell, set()).add(p.id)
+        self.point_cell_of[p.id] = cell
+        if p.is_control and p.anchor is not None:
+            self.controls.setdefault(p.anchor, set()).add(p.id)
+
+    def remove_point(self, p: Point) -> None:
+        pid = p.id
+        cell = self.point_cell_of.pop(pid, None)
+        if cell is not None:
+            self.point_cells.get(cell, set()).discard(pid)
+        self.adjacency.pop(pid, None)
+        self.controls.pop(pid, None)
+        if p.is_control and p.anchor is not None:
+            self.controls.get(p.anchor, set()).discard(pid)
+
+    def move_point(self, p: Point) -> None:
+        cell = self._cell(p.pos.x, p.pos.y)
+        old = self.point_cell_of.get(p.id)
+        if old != cell:
+            if old is not None:
+                self.point_cells.get(old, set()).discard(p.id)
+            self.point_cells.setdefault(cell, set()).add(p.id)
+            self.point_cell_of[p.id] = cell
+            # re-bin affected connections only when the point changed cell
+            for cid in tuple(self.adjacency.get(p.id, ())):
+                conn = self._conns.get(cid)
+                if conn is not None:
+                    self._remove_conn_cells(cid)
+                    self._add_conn_cells(conn)
+
+    # ------------------------------------------------------- connections
+    def _add_conn_cells(self, c: Connection) -> None:
+        ids = (c.p1, c.p2, *c.control_ids())
+        xs = [self._points[i].pos.x for i in ids if i in self._points]
+        ys = [self._points[i].pos.y for i in ids if i in self._points]
+        if not xs:
+            return
+        cx0, cy0 = self._cell(min(xs), min(ys))
+        cx1, cy1 = self._cell(max(xs), max(ys))
+        if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) > 4096:
+            self.big_conns.add(c.id)  # giant stroke: checked in every query
+            self.conn_cells_of[c.id] = []
+            return
+        cells = [(cx, cy) for cx in range(cx0, cx1 + 1) for cy in range(cy0, cy1 + 1)]
+        for cell in cells:
+            self.conn_cells.setdefault(cell, set()).add(c.id)
+        self.conn_cells_of[c.id] = cells
+
+    def _remove_conn_cells(self, cid: int) -> None:
+        for cell in self.conn_cells_of.pop(cid, []):
+            self.conn_cells.get(cell, set()).discard(cid)
+        self.big_conns.discard(cid)
+
+    def add_conn(self, c: Connection) -> None:
+        self._add_conn_cells(c)
+        for pid in (c.p1, c.p2, *c.control_ids()):
+            self.adjacency.setdefault(pid, set()).add(c.id)
+
+    def remove_conn(self, cid: int, conn: Connection | None = None) -> None:
+        if conn is None:
+            conn = self._conns.get(cid)
+        self._remove_conn_cells(cid)
+        if conn is not None:
+            for pid in (conn.p1, conn.p2, *conn.control_ids()):
+                adj = self.adjacency.get(pid)
+                if adj:
+                    adj.discard(cid)
+        else:  # conn already dropped from the dict: sweep
+            for adj in self.adjacency.values():
+                adj.discard(cid)
+
+    # ----------------------------------------------------------- queries
+    def points_in_rect(self, x0: float, y0: float, x1: float, y1: float):
+        cx0, cy0 = self._cell(x0, y0)
+        cx1, cy1 = self._cell(x1, y1)
+        for cx in range(cx0, cx1 + 1):
+            for cy in range(cy0, cy1 + 1):
+                bucket = self.point_cells.get((cx, cy))
+                if bucket:
+                    yield from bucket
+
+    def conns_in_rect(self, x0: float, y0: float, x1: float, y1: float) -> set[int]:
+        cx0, cy0 = self._cell(x0, y0)
+        cx1, cy1 = self._cell(x1, y1)
+        out: set[int] = set(self.big_conns)
+        for cx in range(cx0, cx1 + 1):
+            for cy in range(cy0, cy1 + 1):
+                bucket = self.conn_cells.get((cx, cy))
+                if bucket:
+                    out |= bucket
+        return out

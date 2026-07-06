@@ -128,20 +128,28 @@ class VectorLayer(Layer):
         kf = self.keyframes.get(frame)
         if kf is not None:
             return kf
-        shape = self.shape_at(frame)
-        return self.set_keyframe(frame, shape if shape is not None else Shape())
+        k0, k1, t = self._segment(frame)
+        if k0 is None:
+            shape = Shape()
+        elif k1 is None or t <= 0.0:
+            shape = k0.shape.clone()
+        else:
+            shape = interpolate_shapes(k0.shape, k1.shape, t)
+        return self.set_keyframe(frame, shape)
 
     def shape_at(self, frame: int) -> Shape | None:
-        """Interpolated shape shown at *frame* (None = layer not present yet).
+        """Shape shown at *frame* (None = layer not present yet).
 
-        Always returns a private clone safe to mutate for preview; edits must
-        go through ensure_keyframe().shape.
+        On exact/held keyframes this returns the keyframe's live shape — do
+        NOT mutate it directly; edit through ensure_keyframe() or an edit
+        session. Between keyframes a fresh interpolated shape is returned.
+        Avoiding the defensive clone keeps repaints O(1) on huge drawings.
         """
         k0, k1, t = self._segment(frame)
         if k0 is None:
             return None
         if k1 is None or t <= 0.0:
-            return k0.shape.clone()
+            return k0.shape
         return interpolate_shapes(k0.shape, k1.shape, t)
 
 
